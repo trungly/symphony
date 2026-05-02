@@ -92,6 +92,8 @@ defmodule SymphonyElixir.Codex.AppServer do
       {:ok, turn_id} ->
         session_id = "#{thread_id}-#{turn_id}"
         Logger.info("Codex session started for #{issue_context(issue)} session_id=#{session_id}")
+        phase_state = new_phase_state(issue, session_id)
+        phase_state = maybe_log_session_phase(phase_state, :context, "turn_started")
 
         emit_message(
           on_message,
@@ -104,7 +106,13 @@ defmodule SymphonyElixir.Codex.AppServer do
           metadata
         )
 
-        case await_turn_completion(port, on_message, tool_executor, auto_approve_requests) do
+        case await_turn_completion(
+               port,
+               on_message,
+               tool_executor,
+               auto_approve_requests,
+               phase_state
+             ) do
           {:ok, result} ->
             Logger.info("Codex session completed for #{issue_context(issue)} session_id=#{session_id}")
 
@@ -326,22 +334,57 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp await_turn_completion(port, on_message, tool_executor, auto_approve_requests) do
+  defp await_turn_completion(port, on_message, tool_executor, auto_approve_requests, phase_state) do
     receive_loop(
       port,
       on_message,
       Config.settings!().codex.turn_timeout_ms,
       "",
       tool_executor,
-      auto_approve_requests
+      auto_approve_requests,
+      phase_state
     )
   end
 
-  defp receive_loop(port, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests) do
+  defp receive_loop(
+         port,
+         on_message,
+         timeout_ms,
+         pending_line,
+         tool_executor,
+         auto_approve_requests,
+         phase_state
+       ) do
     receive do
       {^port, {:data, {:eol, chunk}}} ->
         complete_line = pending_line <> to_string(chunk)
-        handle_incoming(port, on_message, complete_line, timeout_ms, tool_executor, auto_approve_requests)
+
+        case handle_incoming(
+               port,
+               on_message,
+               complete_line,
+               timeout_ms,
+               tool_executor,
+               auto_approve_requests,
+               phase_state
+             ) do
+          {:continue, next_phase_state} ->
+            receive_loop(
+              port,
+              on_message,
+              timeout_ms,
+              "",
+              tool_executor,
+              auto_approve_requests,
+              next_phase_state
+            )
+
+          {:done, result} ->
+            {:ok, result}
+
+          {:error, reason} ->
+            {:error, reason}
+        end
 
       {^port, {:data, {:noeol, chunk}}} ->
         receive_loop(
@@ -350,26 +393,40 @@ defmodule SymphonyElixir.Codex.AppServer do
           timeout_ms,
           pending_line <> to_string(chunk),
           tool_executor,
-          auto_approve_requests
+          auto_approve_requests,
+          phase_state
         )
 
       {^port, {:exit_status, status}} ->
+        maybe_log_session_phase(phase_state, :handoff, "port_exit")
         {:error, {:port_exit, status}}
     after
       timeout_ms ->
+        maybe_log_session_phase(phase_state, :handoff, "turn_timeout")
         {:error, :turn_timeout}
     end
   end
 
-  defp handle_incoming(port, on_message, data, timeout_ms, tool_executor, auto_approve_requests) do
+  defp handle_incoming(
+         port,
+         on_message,
+         data,
+         timeout_ms,
+         tool_executor,
+         auto_approve_requests,
+         phase_state
+       ) do
     payload_string = to_string(data)
 
     case Jason.decode(payload_string) do
       {:ok, %{"method" => "turn/completed"} = payload} ->
+        maybe_log_session_phase(phase_state, :handoff, "turn/completed")
         emit_turn_event(on_message, :turn_completed, payload, payload_string, port, payload)
-        {:ok, :turn_completed}
+        {:done, :turn_completed}
 
       {:ok, %{"method" => "turn/failed", "params" => _} = payload} ->
+        maybe_log_session_phase(phase_state, :handoff, "turn/failed")
+
         emit_turn_event(
           on_message,
           :turn_failed,
@@ -382,6 +439,8 @@ defmodule SymphonyElixir.Codex.AppServer do
         {:error, {:turn_failed, Map.get(payload, "params")}}
 
       {:ok, %{"method" => "turn/cancelled", "params" => _} = payload} ->
+        maybe_log_session_phase(phase_state, :handoff, "turn/cancelled")
+
         emit_turn_event(
           on_message,
           :turn_cancelled,
@@ -403,7 +462,8 @@ defmodule SymphonyElixir.Codex.AppServer do
           method,
           timeout_ms,
           tool_executor,
-          auto_approve_requests
+          auto_approve_requests,
+          phase_state
         )
 
       {:ok, payload} ->
@@ -417,7 +477,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           metadata_from_message(port, payload)
         )
 
-        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+        {:continue, phase_state}
 
       {:error, _reason} ->
         log_non_json_stream_line(payload_string, "turn stream")
@@ -434,7 +494,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           )
         end
 
-        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+        {:continue, phase_state}
     end
   end
 
@@ -457,11 +517,13 @@ defmodule SymphonyElixir.Codex.AppServer do
          payload,
          payload_string,
          method,
-         timeout_ms,
+         _timeout_ms,
          tool_executor,
-         auto_approve_requests
+         auto_approve_requests,
+         phase_state
        ) do
     metadata = metadata_from_message(port, payload)
+    phase_state = maybe_log_session_phase_for_method(phase_state, method)
 
     case maybe_handle_approval_request(
            port,
@@ -474,6 +536,8 @@ defmodule SymphonyElixir.Codex.AppServer do
            auto_approve_requests
          ) do
       :input_required ->
+        maybe_log_session_phase(phase_state, :handoff, "turn_input_required")
+
         emit_message(
           on_message,
           :turn_input_required,
@@ -484,9 +548,11 @@ defmodule SymphonyElixir.Codex.AppServer do
         {:error, {:turn_input_required, payload}}
 
       :approved ->
-        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+        {:continue, phase_state}
 
       :approval_required ->
+        maybe_log_session_phase(phase_state, :handoff, "approval_required")
+
         emit_message(
           on_message,
           :approval_required,
@@ -498,6 +564,8 @@ defmodule SymphonyElixir.Codex.AppServer do
 
       :unhandled ->
         if needs_input?(method, payload) do
+          maybe_log_session_phase(phase_state, :handoff, "turn_input_required")
+
           emit_message(
             on_message,
             :turn_input_required,
@@ -518,7 +586,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           )
 
           Logger.debug("Codex notification: #{inspect(method)}")
-          receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+          {:continue, phase_state}
         end
     end
   end
@@ -989,6 +1057,43 @@ defmodule SymphonyElixir.Codex.AppServer do
   defp issue_context(%{id: issue_id, identifier: identifier}) do
     "issue_id=#{issue_id} issue_identifier=#{identifier}"
   end
+
+  defp new_phase_state(issue, session_id) do
+    %{
+      issue_context: issue_context(issue),
+      session_id: session_id,
+      emitted_phases: MapSet.new()
+    }
+  end
+
+  defp maybe_log_session_phase(phase_state, phase, trigger)
+       when is_map(phase_state) and is_atom(phase) and is_binary(trigger) do
+    if MapSet.member?(phase_state.emitted_phases, phase) do
+      phase_state
+    else
+      Logger.info("Codex session phase marker for #{phase_state.issue_context} session_id=#{phase_state.session_id} phase=#{phase} trigger=#{trigger}")
+
+      %{phase_state | emitted_phases: MapSet.put(phase_state.emitted_phases, phase)}
+    end
+  end
+
+  defp maybe_log_session_phase(phase_state, _phase, _trigger), do: phase_state
+
+  defp maybe_log_session_phase_for_method(phase_state, method)
+       when is_map(phase_state) and is_binary(method) do
+    cond do
+      method in ["item/fileChange/requestApproval", "item/fileChange/outputDelta"] ->
+        maybe_log_session_phase(phase_state, :edit, method)
+
+      method in ["item/commandExecution/requestApproval", "item/commandExecution/outputDelta"] ->
+        maybe_log_session_phase(phase_state, :verify, method)
+
+      true ->
+        phase_state
+    end
+  end
+
+  defp maybe_log_session_phase_for_method(phase_state, _method), do: phase_state
 
   defp stop_port(port) when is_port(port) do
     case :erlang.port_info(port) do
