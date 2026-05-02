@@ -1205,6 +1205,90 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
+  test "app server logs explicit session phase markers in turn order" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-phase-markers-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-PHASE")
+      codex_binary = Path.join(test_root, "fake-codex")
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+      while IFS= read -r line; do
+        count=$((count + 1))
+
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-phase"}}}'
+            ;;
+          3)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-phase"}}}'
+            printf '%s\\n' '{"id":201,"method":"item/fileChange/requestApproval","params":{"fileChangeCount":1}}'
+            printf '%s\\n' '{"id":202,"method":"item/commandExecution/requestApproval","params":{"command":"mix test","cwd":"/tmp","reason":"verify"}}'
+            ;;
+          4)
+            ;;
+          5)
+            ;;
+          6)
+            printf '%s\\n' '{"method":"turn/completed"}'
+            exit 0
+            ;;
+          *)
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server",
+        codex_approval_policy: "never"
+      )
+
+      issue = %Issue{
+        id: "issue-phase-markers",
+        identifier: "MT-PHASE",
+        title: "Log explicit phase markers",
+        description: "Ensure phase markers are visible in the Symphony log stream",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-PHASE",
+        labels: ["backend"]
+      }
+
+      log =
+        capture_log(fn ->
+          assert {:ok, _result} = AppServer.run(workspace, "Log explicit phase markers", issue)
+        end)
+
+      marker_phases =
+        log
+        |> String.split("\n", trim: true)
+        |> Enum.filter(&String.contains?(&1, "Codex session phase marker"))
+        |> Enum.map(fn line ->
+          [_, phase] = Regex.run(~r/phase=([a-z]+)\b/, line)
+          phase
+        end)
+
+      assert marker_phases == ["context", "edit", "verify", "handoff"]
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "app server emits malformed events for JSON-like protocol lines that fail to decode" do
     test_root =
       Path.join(
